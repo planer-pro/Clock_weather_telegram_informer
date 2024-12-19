@@ -1,0 +1,17 @@
+                                .ON
+                                .OFF
+                                .RST
+                                .HLP
+// TELEG_PERIOD                    .TPR (sec)
+// NTP_PERIOD                      .NPR (sec)
+// DHT_PERIOD                      .DPR (sec)
+// WEATHER_PERIOD                  .WPR (min)
+// BEEP_PERIOD                     .BPR (ms)
+// BEEP_COUNT                      .DCT (val)
+BOTtoken                        .BTK (val)
+OPEN_WEATHER_MAP_APP_ID         .OID (val)
+// OPEN_WEATHER_MAP_LANGUAGE       .OLG (val)
+OPEN_WEATHER_MAP_LOCATTION_LAT  .OLT (val)
+OPEN_WEATHER_MAP_LOCATTION_LON  .OLN (val)
+display brightness              .DBR (val)  *
+GreatingDisplayMessage          .SDM (val)
