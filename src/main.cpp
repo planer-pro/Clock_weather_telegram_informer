@@ -1,353 +1,377 @@
+/**
+ * @file main.cpp
+ * @brief Точка входа приложения ESP8266 Clock Informer
+ *
+ * Устройство отображает время, дату, температуру и погоду на LED матрице MAX7219.
+ * Управление через Telegram бота.
+ *
+ * @author Clock Informer Team
+ * @date 2026-03-25
+ */
+
 #include <Arduino.h>
-#include <MD_Parola.h>
-#include <6bite_rus.h>
-#include <ArduinoOTA.h>
-#include <ESP8266WiFi.h>
-#include <CTBot.h>
-#include <NTPClient.h>
-// #include <WiFiUdp.h>
-#include <DHT.h>
-// #include <JsonListener.h>
-// #include <time.h>
-#include <OpenWeatherMapOneCall.h>
 
-#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
-#define MAX_DEVICES 4
-#define CLK_PIN 14
-#define DATA_PIN 13
-#define CS_PIN 12
-#define BEEP_PIN 5
-#define DHTPIN 2
+// Модули проекта
+#include "config.h"
+#include "constants.h"
 
-#define TELEG_PERIOD 500 // 1/2 sec
-#define NTP_PERIOD 30000 // 1/2 min
-#define DHT_PERIOD 10000 // 10 sec
-// #define WEATHER_PERIOD 1800000 // 30 min
-#define WEATHER_PERIOD 600000 // 10 min
-#define BEEP_PERIOD 80
-#define BEEP_COUNT 2
+// Менеджеры
+#include "network.h"
+#include "display.h"
+#include "sensors.h"
+#include "weather.h"
+#include "telegram_bot.h"
+#include "async_beep.h"
+#include "utils.h"
 
-#define BOTtoken "bot_token_here" //@hata2bot 46 Chars
-#define BUF_SIZE 512
+// ============================================================================
+// Глобальные объекты
+// ============================================================================
 
-struct sCatalog
-{
-  textEffect_t effect;
-  const char *psz;
-  uint16_t speed;
-  uint16_t pause;
+/// Менеджер сетевого подключения (WiFi + NTP)
+NetworkManager network;
+
+/// Менеджер дисплея MAX7219
+DisplayManager display;
+
+/// Менеджер датчиков (DHT22)
+SensorsManager sensors;
+
+/// Менеджер погодных данных
+WeatherManager weather;
+
+/// Менеджер Telegram бота
+TelegramBotManager telegram;
+
+/// Неблокирующий буззер
+AsyncBeep beep;
+
+// ============================================================================
+// State Machine - Основные режимы работы
+// ============================================================================
+
+/**
+ * @brief Состояние главного цикла
+ *
+ * State machine для неблокирующего переключения между экранами
+ */
+enum class MainState {
+    /// Режим ожиданияWiFi подключения
+    INITIALIZING,
+    /// Режим подключения к WiFi
+    CONNECTING_WIFI,
+    /// Режим обновления данных
+    UPDATING_DATA,
+    /// Отображение времени
+    SHOW_TIME,
+    /// Отображение даты
+    SHOW_DATE,
+    /// Отображение температуры внутри
+    SHOW_INDOOR_TEMP,
+    /// Отображение погоды
+    SHOW_WEATHER,
+    /// Отображение сообщения из Telegram
+    SHOW_MESSAGE,
+    /// Режим работы (обычный цикл)
+    NORMAL
 };
 
-sCatalog catalog[] =
-    {
-        {PA_PRINT, "", 40, 3000},
-        {PA_SCROLL_UP, "", 40, 3000},
-        {PA_SCROLL_DOWN, "", 40, 3000},
-        {PA_SCROLL_LEFT, "", 40, 3000},
-        {PA_SCROLL_RIGHT, "", 40, 3000},
-        {PA_SPRITE, "", 40, 3000},
-        {PA_SLICE, "", 8, 3000},
-        {PA_MESH, "", 80, 3000},
-        {PA_FADE, "", 125, 3000},
-        {PA_DISSOLVE, "", 250, 3000},
-        {PA_BLINDS, "", 60, 3000},
-        {PA_RANDOM, "", 25, 3000},
-        {PA_WIPE, "", 40, 3000},
-        {PA_WIPE_CURSOR, "", 40, 3000},
-        {PA_SCAN_HORIZ, "", 40, 3000},
-        {PA_SCAN_HORIZX, "", 40, 3000},
-        {PA_SCAN_VERT, "", 40, 3000},
-        {PA_SCAN_VERTX, "", 40, 3000},
-        {PA_OPENING, "", 40, 3000},
-        {PA_OPENING_CURSOR, "", 40, 3000},
-        {PA_CLOSING, "", 40, 3000},
-        {PA_CLOSING_CURSOR, "", 40, 3000},
-        {PA_SCROLL_UP_LEFT, "", 40, 3000},
-        {PA_SCROLL_UP_RIGHT, "", 40, 3000},
-        {PA_SCROLL_DOWN_LEFT, "", 40, 3000},
-        {PA_SCROLL_DOWN_RIGHT, "", 40, 3000},
-        {PA_GROW_UP, "", 40, 3000},
-        {PA_GROW_DOWN, "", 40, 3000},
-};
+/// Текущее состояние state machine
+MainState currentState = MainState::INITIALIZING;
 
-String OPEN_WEATHER_MAP_APP_ID = "3d653a91e0205d59d2e8a701f0b0db39"; // 32 Chars
-String OPEN_WEATHER_MAP_LANGUAGE = "ru";
-float OPEN_WEATHER_MAP_LOCATTION_LAT = 53.972875; // 9 Chars
-float OPEN_WEATHER_MAP_LOCATTION_LON = 27.830926;
-boolean IS_METRIC = true;
+/// Следующее состояние для перехода
+MainState nextState = MainState::SHOW_TIME;
 
-uint32_t _tmTelergamReq, _tmNtp, _tmDht, _tmWeather;
-uint8_t mainStage;
+/// Счётчик циклов (для последовательного отображения)
+uint8_t cycleCounter = 0;
 
-MD_Parola P = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
-CTBot myBot;
-DHT dht(DHTPIN, DHT22);
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP);
-OpenWeatherMapOneCallData openWeatherMapOneCallData;
+/// Состояние обновления погоды (для асинхронности)
+bool weatherUpdatePending = false;
 
-char ssid[] = "ssid_here"; // 20 Chars
-char pass[] = "pass_here"; // 20 Chars
+/// Сообщение из Telegram для отображения
+String customMessage;
 
-char curDisplayMessage[BUF_SIZE] = {"Home Technologies"}; // 17 Chars
-String weekCatalg[] = {" Воскресенье", " Понедельник", " Вторник", " Среда", " Четверг", " Пятница", " Суббота"};
-String monthCatalog[] = {"января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"};
-String timeLine;
-String dateLine;
-String dhtLine;
-String weatherLine;
+// ============================================================================
+// Временные метки
+// ============================================================================
 
-void getTMessageToVars();
-void playBeep();
-void getTimeToVars();
-void getDhtData();
-void getWeatherToVars();
+/// Время последнего обновления NTP
+uint32_t lastNtpUpdate = 0;
 
-void setup()
-{
-  Serial.begin(115200);
+/// Время последнего чтения DHT
+uint32_t lastDhtRead = 0;
 
-  pinMode(BEEP_PIN, OUTPUT);
+/// Время последнего обновления погоды
+uint32_t lastWeatherUpdate = 0;
 
-  randomSeed(analogRead(A0));
+// ============================================================================
+// Функции обратного вызова
+// ============================================================================
 
-  Serial.println("\nConnecting");
+/**
+ * @brief Callback для отображения сообщения из Telegram
+ *
+ * Вызывается когда пользователь отправляет текстовое сообщение (не команду).
+ */
+void onTelegramMessage(const String& message) {
+    Serial.print(F("[Callback] Telegram message: "));
+    Serial.println(message);
 
-  myBot.wifiConnect(ssid, pass);
-  myBot.setTelegramToken(BOTtoken);
+    // Сохранить сообщение для отображения
+    customMessage = message;
 
-  if (myBot.testConnection())
-    Serial.println("\ntestConnection OK");
-  else
-    Serial.println("\ntestConnection NOK");
+    // Воспроизвести звуковой сигнал
+    beep.play(BEEP_COUNT, BEEP_DURATION, BEEP_DURATION);
 
-  ArduinoOTA.begin();
-
-  timeClient.begin();
-  timeClient.setTimeOffset(10800);
-
-  dht.begin();
-
-  P.begin();
-  P.setInvert(false);
-  P.setIntensity(0);
-  P.setFont(0, _6bite_rus);
-
-  _tmTelergamReq = millis() + TELEG_PERIOD; // quick start whithout delay
-  _tmNtp = millis() + NTP_PERIOD;
-  _tmDht = millis() + DHT_PERIOD;
-  _tmWeather = millis() + WEATHER_PERIOD;
-
-  P.displayText(curDisplayMessage, PA_CENTER, 25, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
-  while (!P.displayAnimate())
-    ESP.wdtFeed();
+    // Переключить состояние
+    currentState = MainState::SHOW_MESSAGE;
 }
 
-void loop()
-{
-  // getTimeToVars();
-  // getWeatherToVars();
-  // getTMessageToVars();
-  // playBeep();
+// ============================================================================
+// Вспомогательные функции
+// ============================================================================
 
-  ArduinoOTA.handle();
+/**
+ * @brief Обновление всех периодических данных
+ *
+ * Вызывается каждый цикл для проверки необходимости обновления
+ */
+void updatePeriodicData() {
+    uint32_t now = millis();
 
-  getTMessageToVars();
-
-  static uint8_t rnd;
-  static uint8_t _dobav;
-
-  switch (mainStage)
-  {
-  case 0:
-    getTimeToVars();
-
-    timeLine.toCharArray(curDisplayMessage, BUF_SIZE);
-    rnd = random(6, 27);
-
-    P.displayText(curDisplayMessage, PA_CENTER, catalog[rnd].speed, 4000, catalog[rnd].effect, catalog[rnd].effect);
-    while (!P.displayAnimate())
-      ESP.wdtFeed();
-
-    if (_dobav == 3)
-      _dobav = 0;
-
-    mainStage = ++_dobav;
-    break;
-
-  case 1:
-    dateLine.toCharArray(curDisplayMessage, BUF_SIZE);
-    P.displayText(curDisplayMessage, PA_CENTER, 25, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
-    while (!P.displayAnimate())
-      ESP.wdtFeed();
-
-    mainStage = 0;
-    break;
-
-  case 2:
-    getDhtData();
-
-    dhtLine.toCharArray(curDisplayMessage, BUF_SIZE);
-    P.displayText(curDisplayMessage, PA_CENTER, 25, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
-    while (!P.displayAnimate())
-      ESP.wdtFeed();
-
-    mainStage = 0;
-    break;
-
-  case 3:
-    getWeatherToVars();
-
-    weatherLine.toCharArray(curDisplayMessage, BUF_SIZE);
-    P.displayText(curDisplayMessage, PA_CENTER, 25, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
-    while (!P.displayAnimate())
-      ESP.wdtFeed();
-
-    mainStage = 0;
-    break;
-
-  case 4:
-    P.displayText(curDisplayMessage, PA_CENTER, 25, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
-    while (!P.displayAnimate())
-      ESP.wdtFeed();
-
-    mainStage = 0;
-    break;
-  }
-}
-
-void getTimeToVars()
-{
-  if (millis() - _tmNtp > NTP_PERIOD)
-  {
-    timeClient.forceUpdate();
-
-    uint8_t hr, mn;
-
-    hr = timeClient.getHours();
-    mn = timeClient.getMinutes();
-
-    timeClient.getFormattedTime();
-
-    String dw = weekCatalg[timeClient.getDay()];
-
-    String formattedDate = timeClient.getFormattedDate();
-    int splitT = formattedDate.indexOf("T");
-    String data = formattedDate.substring(0, splitT);
-
-    String yr, ms, dy;
-
-    for (size_t i = 0; i < data.length(); i++)
-    {
-      if (i == constrain(i, 0, 3))
-        yr += data[i];
-      else if (i == constrain(i, 5, 6))
-        ms += data[i];
-      else if (i == constrain(i, 8, data.length()))
-        dy += data[i];
+    // Обновление NTP (каждые NTP_PERIOD)
+    if (now - lastNtpUpdate >= NTP_UPDATE_PERIOD) {
+        network.updateNTP(true);
+        lastNtpUpdate = now;
     }
 
-    timeLine = hr < 10 ? "0" + (String)hr + ":" : (String)hr + ":";
-    timeLine += mn < 10 ? "0" + (String)mn : (String)mn;
-    dateLine = dw + " " + (String)dy.toInt() + " " + monthCatalog[ms.toInt() - 1] + " " + yr + " года";
+    // Чтение датчика DHT (каждые DHT_READ_PERIOD)
+    if (now - lastDhtRead >= DHT_READ_PERIOD) {
+        sensors.update();
+        lastDhtRead = now;
+    }
 
-    _tmNtp = millis();
-  }
+    // Обновление погоды (каждые WEATHER_UPDATE_PERIOD)
+    // Выполняется асинхронно - запрос отправляется, ответ обрабатывается
+    if (now - lastWeatherUpdate >= WEATHER_UPDATE_PERIOD || !weather.hasValidData()) {
+        weather.update();
+        lastWeatherUpdate = now;
+    }
 }
 
-void getDhtData()
-{
-  if (millis() - _tmDht > DHT_PERIOD)
-  {
-    float h = dht.readHumidity();
-    float t = dht.readTemperature();
-
-    String st = (String)t;
-    String sh = (String)h;
-
-    st.remove(st.length() - 1);
-    sh.remove(sh.length() - 1);
-
-    dhtLine = " Температура в доме: " + st + "C, " + "Влажность: " + sh + "%";
-
-    _tmDht = millis();
-  }
+/**
+ * @brief Форматирование и отображение времени
+ */
+void showTimeDisplay() {
+    char timeBuf[16];
+    formatTime(network.getHours(), network.getMinutes(), timeBuf, sizeof(timeBuf));
+    display.showTime(timeBuf, true);
 }
 
-void getWeatherToVars()
-{
-  if (millis() - _tmWeather > WEATHER_PERIOD)
-  {
-    OpenWeatherMapOneCall *oneCallClient = new OpenWeatherMapOneCall();
-
-    oneCallClient->setMetric(IS_METRIC);
-    oneCallClient->setLanguage(OPEN_WEATHER_MAP_LANGUAGE);
-    oneCallClient->update(&openWeatherMapOneCallData, OPEN_WEATHER_MAP_APP_ID, OPEN_WEATHER_MAP_LOCATTION_LAT, OPEN_WEATHER_MAP_LOCATTION_LON);
-
-    delete oneCallClient;
-    oneCallClient = nullptr;
-
-    weatherLine = " На улице: ";
-    weatherLine += String(openWeatherMapOneCallData.current.temp, 1) + "C, " + openWeatherMapOneCallData.current.weatherDescription;
-
-    _tmWeather = millis();
-  }
+/**
+ * @brief Форматирование и отображение даты
+ */
+void showDateDisplay() {
+    char dateBuf[32];
+    formatDateRussian(network.getDay(), network.getMonth(), network.getYear(),
+                    network.getDayOfWeek(), dateBuf, sizeof(dateBuf));
+    display.showDate(dateBuf);
 }
 
-void getTMessageToVars()
-{
-  if (millis() - _tmTelergamReq > TELEG_PERIOD)
-  {
-    TBMessage msg;
+/**
+ * @brief Отображение температуры внутри
+ */
+void showIndoorTempDisplay() {
+    if (sensors.hasValidData()) {
+        float t = sensors.getTemperature();
+        float h = sensors.getHumidity();
+        display.showIndoorTemp(t, h);
+    } else {
+        display.showCustomMessage(" Ошибка датчика DHT");
+    }
+}
 
-    if (CTBotMessageText == myBot.getNewMessage(msg))
-    {
-      String s = msg.text;
+/**
+ * @brief Отображение погоды
+ */
+void showWeatherDisplay() {
+    if (weather.hasValidData()) {
+        float t = weather.getTemperature();
+        const String& desc = weather.getDescription();
+        display.showOutdoorTemp(t, desc.c_str());
+    } else {
+        display.showCustomMessage(" Погода недоступна");
+    }
+}
 
-      if (s[0] == '.')
-      {
-        if (s[1] == 'D' && s[2] == 'B' && s[3] == 'R')
-        {
-          s.remove(0, 4);
+/**
+ * @brief Отображение сообщения из Telegram
+ */
+void showMessageDisplay() {
+    display.showCustomMessage(customMessage.c_str(), true);
+}
 
-          for (size_t i = 0; i < s.length(); i++)
-          {
-            if (!isDigit(s[i]))
-              myBot.sendMessage(msg.sender.id, "Не верный параметр. От 0-15");
-          }
-          int n = s.toInt();
+// ============================================================================
+// Основной цикл - State Machine
+// ============================================================================
 
-          if (n < 0 || n > 15)
-            myBot.sendMessage(msg.sender.id, "Параметр выходит за пределы. От 0-15");
-          else
-          {
-            myBot.sendMessage(msg.sender.id, "Команда выполнена");
-            P.setIntensity(n);
-          }
+/**
+ * @brief Обработка state machine
+ *
+ * Вызывается в каждом loop() для неблокирующего переключения состояний
+ */
+void processStateMachine() {
+    // Состояние WAITING - ждём завершения анимации
+    if (!display.update()) {
+        return; // Анимация продолжается
+    }
+
+    // Анимация завершена - проверяем текущее состояние
+    switch (currentState) {
+    // ========== Инициализация и подключение ==========
+    case MainState::INITIALIZING:
+        display.showStartup();
+        currentState = MainState::CONNECTING_WIFI;
+        break;
+
+    case MainState::CONNECTING_WIFI:
+        network.connect(WIFI_SSID, WIFI_PASSWORD);
+        currentState = MainState::UPDATING_DATA;
+        break;
+
+    case MainState::UPDATING_DATA:
+        // Проверка подключения WiFi
+        if (!network.isConnected()) {
+            network.update();
+            return; // Ожидаем подключения
         }
-        else
-          myBot.sendMessage(msg.sender.id, "Не описанная команда");
-      }
-      else
-      {
-        myBot.sendMessage(msg.sender.id, "Сообщение принято");
-        playBeep();
-        msg.text.toCharArray(curDisplayMessage, BUF_SIZE);
 
-        mainStage = 4;
-      }
+        // Подключение к Telegram
+        if (!telegram.isConnected()) {
+            telegram.begin();
+        }
+
+        // Переход к нормальному режиму
+        currentState = MainState::NORMAL;
+        break;
+
+    // ========== Нормальный режим работы ==========
+    case MainState::NORMAL:
+        // Определяем следующий экран на основе счётчика
+        switch (cycleCounter) {
+        case 0:
+            currentState = MainState::SHOW_TIME;
+            break;
+        case 1:
+            currentState = MainState::SHOW_DATE;
+            break;
+        case 2:
+            currentState = MainState::SHOW_INDOOR_TEMP;
+            break;
+        case 3:
+            currentState = MainState::SHOW_WEATHER;
+            break;
+        }
+
+        cycleCounter = (cycleCounter + 1) % 4;
+        break;
+
+    // ========== Отображение экранов ==========
+    case MainState::SHOW_TIME:
+        showTimeDisplay();
+        // После завершения этой анимации перейдём к следующему экрану
+        nextState = MainState::NORMAL;
+        break;
+
+    case MainState::SHOW_DATE:
+        showDateDisplay();
+        nextState = MainState::NORMAL;
+        break;
+
+    case MainState::SHOW_INDOOR_TEMP:
+        showIndoorTempDisplay();
+        nextState = MainState::NORMAL;
+        break;
+
+    case MainState::SHOW_WEATHER:
+        showWeatherDisplay();
+        nextState = MainState::NORMAL;
+        break;
+
+    case MainState::SHOW_MESSAGE:
+        showMessageDisplay();
+        // После сообщения вернёмся к нормальному циклу
+        nextState = MainState::NORMAL;
+        break;
     }
-
-    _tmTelergamReq = millis();
-  }
 }
 
-void playBeep()
-{
-  for (size_t i = 0; i < (BEEP_COUNT * 2); i++)
-  {
-    digitalWrite(BEEP_PIN, !digitalRead(BEEP_PIN));
-    if (i != (BEEP_COUNT * 2) - 1)
-      delay(BEEP_PERIOD);
-  }
+// ============================================================================
+// Arduino Setup & Loop
+// ============================================================================
+
+/**
+ * @brief Инициализация всех компонентов
+ */
+void setup() {
+    // Инициализация Serial
+    Serial.begin(115200);
+    Serial.println(F("\n"));
+    Serial.println(F("========================================"));
+    Serial.println(F("Clock Informer v2.0"));
+    Serial.println(F("ESP8266 Weather & Telegram Display"));
+    Serial.println(F("========================================"));
+
+    // Инициализация генератора случайных чисел
+    randomSeed(analogRead(A0));
+
+    // Инициализация модулей
+    beep.begin();
+    network.begin();
+    display.begin();
+    sensors.begin();
+    weather.begin();
+
+    // Настройка Telegram бота
+    telegram.setModules(&display, &sensors, &weather);
+    telegram.setMessageCallback(onTelegramMessage);
+
+    // Начальная яркость
+    display.setIntensity(DEFAULT_DISPLAY_INTENSITY);
+
+    Serial.println(F("[System] Setup complete"));
+}
+
+/**
+ * @brief Главный цикл приложения
+ *
+ * Неблокирующий цикл с state machine для отображения
+ */
+void loop() {
+    // Обновление сети (WiFi + OTA + NTP)
+    network.update();
+
+    // Если WiFi не подключён - ничего больше не делаем
+    if (!network.isConnected()) {
+        return;
+    }
+
+    // Обновление периодических данных
+    updatePeriodicData();
+
+    // Обновление Telegram бота (приём сообщений)
+    telegram.update();
+
+    // Обновление буззера
+    beep.update();
+
+    // Обработка state machine для отображения
+    processStateMachine();
+
+    // Переход к следующему состоянию после завершения анимации
+    if (display.isAnimating() == false && currentState != MainState::UPDATING_DATA) {
+        if (nextState != MainState::NORMAL) {
+            currentState = nextState;
+        }
+    }
 }
